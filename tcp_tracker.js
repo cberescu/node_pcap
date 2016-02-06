@@ -28,23 +28,23 @@ TCPTracker.prototype.track_packet = function (packet) {
         session = this.sessions[key];
         if (! session) {
             is_new = true;
-            session = new TCPSession();
+            session = new TCPSession(packet);
             this.sessions[key] = session;
         }
-
+		if (is_new) {
+            this.emit("session", session);
+        }
         session.track(packet);
 
         // need to track at least one packet before we emit this new session, otherwise nothing
         // will be initialized.
-        if (is_new) {
-            this.emit("session", session);
-        }
+        
     }
     // silently ignore any non IPv4 TCP packets
     // user should filter these out with their pcap filter, but oh well.
 };
 
-function TCPSession() {
+function TCPSession(packet) {
     this.src = null;
     this.src_name = null; // from DNS
     this.dst = null;
@@ -80,6 +80,33 @@ function TCPSession() {
     this.recv_bytes_payload = 0;
 
     EventEmitter.call(this);
+	
+	var ip  = packet.payload.payload;
+    var tcp = ip.payload;
+    var src = ip.saddr + ":" + tcp.sport;
+    var dst = ip.daddr + ":" + tcp.dport;
+	
+	this.src = src; // the side the sent the first packet we saw
+	this.src_name = src;
+	this.dst = dst; // the side that the first packet we saw was sent to
+	this.dst_name = dst;
+
+	if (tcp.flags.syn && !tcp.flags.ack) { // initial SYN, best case
+		this.state = "SYN_SENT";
+	} else { // joining session already in progress
+		this.missed_syn = true;
+		this.connect_time = this.current_cap_time;
+		this.state = "ESTAB";  // I mean, probably established, right? Unless it isn't.
+	}
+	
+	
+	this.syn_time = this.current_cap_time;
+	this.send_isn = tcp.seqno;
+	this.send_window_scale = tcp.options.window_scale || 1; // multipler, not bit shift value
+	this.send_next_seq = tcp.seqno + 1;
+	this.send_bytes_ip = ip.header_bytes;
+	this.send_bytes_tcp = tcp.header_bytes;
+	
 }
 inherits(TCPSession, EventEmitter);
 
@@ -92,25 +119,7 @@ TCPSession.prototype.track = function (packet) {
     this.current_cap_time = packet.pcap_header.tv_sec + (packet.pcap_header.tv_usec / 1000000);
 
     if (this.state === null) {
-        this.src = src; // the side the sent the first packet we saw
-        this.src_name = src;
-        this.dst = dst; // the side that the first packet we saw was sent to
-        this.dst_name = dst;
-
-        if (tcp.flags.syn && !tcp.flags.ack) { // initial SYN, best case
-            this.state = "SYN_SENT";
-        } else { // joining session already in progress
-            this.missed_syn = true;
-            this.connect_time = this.current_cap_time;
-            this.state = "ESTAB";  // I mean, probably established, right? Unless it isn't.
-        }
-
-        this.syn_time = this.current_cap_time;
-        this.send_isn = tcp.seqno;
-        this.send_window_scale = tcp.options.window_scale || 1; // multipler, not bit shift value
-        this.send_next_seq = tcp.seqno + 1;
-        this.send_bytes_ip = ip.headerLength;
-        this.send_bytes_tcp = tcp.headerLength;
+       console.log('BREAKKKKKKKKKKK!!!!');
     } else if (tcp.flags.syn && !tcp.flags.ack) {
         this.emit("syn retry", this);
     } else { // not a SYN, so run the state machine
@@ -124,8 +133,8 @@ TCPSession.prototype.SYN_SENT = function (packet) {
     var src = ip.saddr + ":" + tcp.sport;
 
     if (src === this.dst && tcp.flags.syn && tcp.flags.ack) {
-        this.recv_bytes_ip += ip.headerLength;
-        this.recv_bytes_tcp += tcp.headerLength;
+        this.recv_bytes_ip += ip.header_bytes;
+        this.recv_bytes_tcp += tcp.header_bytes;
         this.recv_packets[tcp.seqno + 1] = this.current_cap_time;
         this.recv_acks[tcp.ackno] = this.current_cap_time;
         this.recv_isn = tcp.seqno;
@@ -145,8 +154,8 @@ TCPSession.prototype.SYN_RCVD = function (packet) {
     var src = ip.saddr + ":" + tcp.sport;
 
     if (src === this.src && tcp.flags.ack) { // TODO - make sure SYN flag isn't set, also match src and dst
-        this.send_bytes_ip += ip.headerLength;
-        this.send_bytes_tcp += tcp.headerLength;
+        this.send_bytes_ip += ip.header_bytes;
+        this.send_bytes_tcp += tcp.header_bytes;
         this.send_acks[tcp.ackno] = this.current_cap_time;
         this.connect_time = this.current_cap_time;
         this.emit("start", this);
@@ -167,23 +176,23 @@ TCPSession.prototype.ESTAB = function (packet) {
     var ip  = packet.payload.payload;
     var tcp = ip.payload;
     var src = ip.saddr + ":" + tcp.sport;
-
+	this.packet_size = packet.pcap_header.len;
     if (src === this.src) { // this packet came from the active opener / client
-        this.send_bytes_ip += ip.headerLength;
-        this.send_bytes_tcp += tcp.headerLength;
-        if (tcp.dataLength > 0) {
-            if (this.send_packets[tcp.seqno + tcp.dataLength]) {
-                this.emit("retransmit", this, "send", tcp.seqno + tcp.dataLength);
-                if (this.send_retrans[tcp.seqno + tcp.dataLength]) {
-                    this.send_retrans[tcp.seqno + tcp.dataLength] += 1;
+        this.send_bytes_ip += ip.header_bytes;
+        this.send_bytes_tcp += tcp.header_bytes;
+        if (tcp.data_bytes) {
+            if (this.send_packets[tcp.seqno + tcp.data_bytes]) {
+                this.emit("retransmit", this, "send", tcp.seqno + tcp.data_bytes);
+                if (this.send_retrans[tcp.seqno + tcp.data_bytes]) {
+                    this.send_retrans[tcp.seqno + tcp.data_bytes] += 1;
                 } else {
-                    this.send_retrans[tcp.seqno + tcp.dataLength] = 1;
+                    this.send_retrans[tcp.seqno + tcp.data_bytes] = 1;
                 }
             } else {
                 this.emit("data send", this, tcp.data);
             }
-            this.send_bytes_payload += tcp.dataLength;
-            this.send_packets[tcp.seqno + tcp.dataLength] = this.current_cap_time;
+            this.send_bytes_payload += tcp.data_bytes;
+            this.send_packets[tcp.seqno + tcp.data_bytes] = this.current_cap_time;
         }
         if (this.recv_packets[tcp.ackno]) {
             this.send_acks[tcp.ackno] = this.current_cap_time;
@@ -193,21 +202,21 @@ TCPSession.prototype.ESTAB = function (packet) {
             this.state = "FIN_WAIT";
         }
     } else if (src === this.dst) { // this packet came from the passive opener / server
-        this.recv_bytes_ip += ip.headerLength;
-        this.recv_bytes_tcp += tcp.headerLength;
-        if (tcp.dataLength > 0) {
-            if (this.recv_packets[tcp.seqno + tcp.dataLength]) {
-                this.emit("retransmit", this, "recv", tcp.seqno + tcp.dataLength);
-                if (this.recv_retrans[tcp.seqno + tcp.dataLength]) {
-                    this.recv_retrans[tcp.seqno + tcp.dataLength] += 1;
+        this.recv_bytes_ip += ip.header_bytes;
+        this.recv_bytes_tcp += tcp.header_bytes;
+        if (tcp.data_bytes) {
+            if (this.recv_packets[tcp.seqno + tcp.data_bytes]) {
+                this.emit("retransmit", this, "recv", tcp.seqno + tcp.data_bytes);
+                if (this.recv_retrans[tcp.seqno + tcp.data_bytes]) {
+                    this.recv_retrans[tcp.seqno + tcp.data_bytes] += 1;
                 } else {
-                    this.recv_retrans[tcp.seqno + tcp.dataLength] = 1;
+                    this.recv_retrans[tcp.seqno + tcp.data_bytes] = 1;
                 }
             } else {
                 this.emit("data recv", this, tcp.data);
             }
-            this.recv_bytes_payload += tcp.dataLength;
-            this.recv_packets[tcp.seqno + tcp.dataLength] = this.current_cap_time;
+            this.recv_bytes_payload += tcp.data_bytes;
+            this.recv_packets[tcp.seqno + tcp.data_bytes] = this.current_cap_time;
         }
         if (this.send_packets[tcp.ackno]) {
             this.recv_acks[tcp.ackno] = this.current_cap_time;
@@ -271,7 +280,7 @@ TCPSession.prototype.CLOSING = function (packet) {
 // The states aren't quite right here.  All possible states of FIN and FIN/ACKs aren't handled.
 // So some of the bytes of the session may not be properly accounted for.
 
-TCPSession.prototype.CLOSED = function (/*packet*/) {
+TCPSession.prototype.CLOSED = function (packet) {
     // not sure what to do here. We are closed, so I guess bump some counters or something.
 };
 
